@@ -45,7 +45,7 @@
 
 
 __global__ void binary_histogram(
-  unsigned int * const d_input,
+  unsigned int *const d_input,
   int input_size,
   int item_count,
   int *d_histograms,
@@ -124,7 +124,7 @@ __global__ void simple_reduce_historgrams(
 
 
 void historgram_for_bit(
-  unsigned int *d_values,
+  unsigned int *const d_values,
   int *d_result,
   int value_count,
   int bit
@@ -152,6 +152,128 @@ void historgram_for_bit(
 }
 
 
+__global__ void calculate_predicates(
+  unsigned int *const d_values,
+  int value_count,
+  int *d_result,
+  unsigned int mask,
+  int matching_value
+) {
+  // The index this thread is responsible for
+  int index = threadIdx.x + blockIdx.x * blockDim.x;
+  // Check whether index is valid (last block)
+  if (index < value_count) {
+    // Check if the corresponding bit is set
+    int bit_set = (mask & d_values[index]) > 0;
+    // Invert the result if interested in 0s
+    d_result[index] = (matching_value == 0) ? bit_set^1 : bit_set;
+  }
+}
+
+
+__global__ void local_blelloch_prefix_sum(
+  int *d_input,
+  int input_size,
+  int *d_output
+) {
+  extern __shared__ int temp[];
+  int tid = threadIdx.x;
+  int index = tid + blockIdx.x * blockDim.x;
+
+  // Copy to shared memory.
+  // If index exceeds the input size use zero, so we keep a length which is
+  // a power of two.
+  temp[tid] = (index < input_size) ? d_input[index] : 0;
+  __syncthreads();
+
+  // Create a binary tree, that reduces the (local) elements
+  for (int k = 2; k <= n; k <<= 1) {
+    if ((tid+1) % k == 0) {
+      int offset = k >> 1;
+      temp[tid] = temp[tid] + temp[tid - offset];
+    }
+    __syncthreads();
+  }
+
+  // Set the last (local) element to zero
+  if (tid == (blockDim.x-1)) {
+    temp[tid] = 0;
+  }
+  __syncthreads();
+
+  // Perform downsweep
+  for (int k = n; k > 1; k >>= 1) {
+    if ((tid+1) % k == 0) {
+      int offset = k >> 1;
+      float old_value = temp[tid];
+      int left_child_index = index - offset;
+      temp[tid] = temp[tid] + temp[left_child_index];
+      temp[left_child_index] = old_value;
+   }
+   __syncthreads();
+  }
+
+  // FIXME: Sync should not be necessary here
+  __syncthreads();
+
+  // Copy the results if the index does not execeed the input size
+  if (index < value_count) {
+    d_output[index] = temp[tid];
+  }
+}
+
+
+/**
+ * A two staged exclusive sum scan that can handle an arbitrary number of
+ * elements between 0 and 1024^2.
+ *
+ * Stage 1: 1024 single Blelloch scans with 1024 elements each
+ * Stage 2: 1 Blelloch scan of the 1024 maximums (as required)
+ */
+void prefix_sum(
+  int *d_input,
+  int input_size,
+  int *d_output
+) {
+  // Always use 1024 threads due to Blelloch only works on lenghts that are a
+  // power of two.
+  const int THREAD_COUNT = 1024;
+  const int BLOCK_COUNT = (input_size / THREAD_COUNT) + 1;
+
+  // Execute stage 1
+  int shared_size = THREAD_COUNT * sizeof(int);
+  local_blelloch_prefix_sum<<<BLOCK_COUNT, THREAD_COUNT, shared_size>>>(d_input, input_size, d_output);
+
+  // Execute state 2 (if necessary)
+  if (BLOCK_COUNT > 1) {
+    int *d_block_sums;
+    cudaMalloc((void **) &d_block_sums, sizeof(int) * BLOCK_COUNT);
+    
+    cudaFree(d_block_sums);
+  }
+}
+
+
+void calculate_relativ_positions(
+  unsigned int *const d_values,
+  int value_count,
+  int *d_output,
+  int bit,
+  int matching_value
+) {
+  // Create a bit mask to check the requested bit
+  const unsigned int MASK = 1<<bit;
+  const THREAD_COUNT = 1024;
+  const BLOCK_COUNT = (value_count / THREAD_COUNT) + 1;
+
+  // Calculate the predicates for the values
+  calculate_predicates<<<BLOCK_COUNT, THREAD_COUNT>>>(d_values, value_count, d_output, MASK, matching_value);
+
+  // Execute an exclusive (prefix-)sum scan to get the relative positions
+  // TODO
+}
+
+
 void your_sort(unsigned int* const d_inputVals,
                unsigned int* const d_inputPos,
                unsigned int* const d_outputVals,
@@ -166,6 +288,10 @@ void your_sort(unsigned int* const d_inputVals,
   int *d_histogram;
   cudaMalloc((void **) &d_histogram, sizeof(int) * 2);
 
+  // Allocate device memory for the relative positions
+  int *d_relative_positions;
+  cudaMalloc((void **) &d_relative_positions, sizeof(int) * numElems);
+
   // Process one radix step per bit/digit
   for (int i = 0; i < LENGHT; i++) {
 
@@ -173,7 +299,17 @@ void your_sort(unsigned int* const d_inputVals,
     // for the current bit/digit
     historgram_for_bit(d_inputVals, d_histogram, numElems, i);
 
+    // Calculate relative positions for bits/digit that are equal to 0
+    calculate_relativ_positions(d_inputVals, numElems, d_relative_positions, i, 0);
+
+    // TODO: Scatter
+
+    // Calculate relative positions for bits/digit that are equal to 1
+    calculate_relativ_positions(d_inputVals, numElems, d_relative_positions, i, 1);
+
+    // TODO: Scatter
   }
 
   cudaFree(d_histogram);
+  cudaFree(d_relative_positions);
 }
