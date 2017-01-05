@@ -174,8 +174,7 @@ __global__ void calculate_predicates(
 __global__ void local_blelloch_prefix_sum(
   int *d_input,
   int input_size,
-  int *d_output,
-  int input_spacing
+  int *d_output
 ) {
   extern __shared__ int temp[];
   int tid = threadIdx.x;
@@ -184,11 +183,11 @@ __global__ void local_blelloch_prefix_sum(
   // Copy to shared memory.
   // If index exceeds the input size use zero, so we keep a length which is
   // a power of two.
-  temp[tid] = (index < input_size) ? d_input[index * input_spacing] : 0;
+  temp[tid] = (index < input_size) ? d_input[index] : 0;
   __syncthreads();
 
   // Create a binary tree, that reduces the (local) elements
-  for (int k = 2; k <= n; k <<= 1) {
+  for (int k = 2; k <= blockDim.x; k <<= 1) {
     if ((tid+1) % k == 0) {
       int offset = k >> 1;
       temp[tid] = temp[tid] + temp[tid - offset];
@@ -198,27 +197,24 @@ __global__ void local_blelloch_prefix_sum(
 
   // Set the last (local) element to zero
   if (tid == (blockDim.x-1)) {
-    temp[tid] = 0;
+    temp[tid] = blockIdx.x > 0 ? temp[0] : 0;
   }
   __syncthreads();
 
   // Perform downsweep
-  for (int k = n; k > 1; k >>= 1) {
+  for (int k = blockDim.x; k > 1; k >>= 1) {
     if ((tid+1) % k == 0) {
       int offset = k >> 1;
       float old_value = temp[tid];
-      int left_child_index = index - offset;
+      int left_child_index = tid - offset;
       temp[tid] = temp[tid] + temp[left_child_index];
       temp[left_child_index] = old_value;
    }
    __syncthreads();
   }
 
-  // FIXME: Sync should not be necessary here
-  __syncthreads();
-
   // Copy the results if the index does not execeed the input size
-  if (index < value_count) {
+  if (index < input_size) {
     d_output[index] = temp[tid];
   }
 }
@@ -226,24 +222,34 @@ __global__ void local_blelloch_prefix_sum(
 
 __global__ void add_block_sums(
   int *d_input,
-  int *const d_block_sums,
-  int input_size
+  int input_size,
+  int *const d_block_sums
 ) {
   // Load the corresponding sum into shared memory
-  __shared__ int block_sum = 0;
+  __shared__ int block_sum;
   if (threadIdx.x == 0) {
     block_sum = d_block_sums[blockIdx.x];
   }
   __syncthreads();
 
   // Assert that the index does not execeed the input size
+  int index = threadIdx.x + blockIdx.x * blockDim.x;
   if (index < input_size) {
     // Increment all elements in this block by the corresponding block sum
-    int index = threadIdx.x + blockIdx.x * blockDim.x;
     d_input[index] = d_input[index] + block_sum;
   }
 }
 
+
+__global__ void gather_every_nth(
+  int *const d_input,
+  int *d_output,
+  int n
+) {
+  int index = threadIdx.x + blockIdx.x * blockDim.x;
+  int element_index = (n-1) + (index * n);
+  d_output[index] = d_input[element_index];
+}
 
 /**
  * A two staged exclusive sum scan that can handle an arbitrary number of
@@ -260,11 +266,11 @@ void prefix_sum(
   // Always use 1024 threads due to Blelloch only works on lenghts that are a
   // power of two.
   const int THREAD_COUNT = 1024;
-  const int BLOCK_COUNT = (input_size / THREAD_COUNT) + 1;
+  const int BLOCK_COUNT = ceil(input_size / THREAD_COUNT);
 
   // Execute stage 1
   int shared_size = THREAD_COUNT * sizeof(int);
-  local_blelloch_prefix_sum<<<BLOCK_COUNT, THREAD_COUNT, shared_size>>>(d_input, input_size, d_output, 1);
+  local_blelloch_prefix_sum<<<BLOCK_COUNT, THREAD_COUNT, shared_size>>>(d_input, input_size, d_output);
 
   // Execute state 2 (if necessary)
   if (BLOCK_COUNT > 1) {
@@ -272,12 +278,15 @@ void prefix_sum(
     int *d_block_sums;
     cudaMalloc((void **) &d_block_sums, sizeof(int) * BLOCK_COUNT);
 
+    // Gather local maximums
+    gather_every_nth<<<1, BLOCK_COUNT>>>(d_output, d_block_sums, THREAD_COUNT);
+
     // Scan the final sums of the blocks
     shared_size = BLOCK_COUNT * sizeof(int);
-    local_blelloch_prefix_sum<<<1, BLOCK_COUNT, shared_size>>>(d_output, input_size, d_block_sums, BLOCK_COUNT);
+    local_blelloch_prefix_sum<<<1, BLOCK_COUNT, shared_size>>>(d_block_sums, input_size, d_block_sums);
 
     // Add the block sums to the input items
-    add_block_sums<<<BLOCK_COUNT, THREAD_COUNT>>>(d_input, input_size, d_block_sums);
+    add_block_sums<<<BLOCK_COUNT, THREAD_COUNT>>>(d_output, input_size, d_block_sums);
 
     // Free block sums
     cudaFree(d_block_sums);
@@ -294,8 +303,8 @@ void calculate_relativ_positions(
 ) {
   // Create a bit mask to check the requested bit
   const unsigned int MASK = 1<<bit;
-  const THREAD_COUNT = 1024;
-  const BLOCK_COUNT = (value_count / THREAD_COUNT) + 1;
+  const int THREAD_COUNT = 1024;
+  const int BLOCK_COUNT = (value_count / THREAD_COUNT) + 1;
 
   // Calculate the predicates for the values
   calculate_predicates<<<BLOCK_COUNT, THREAD_COUNT>>>(d_values, value_count, d_output, MASK, matching_value);
