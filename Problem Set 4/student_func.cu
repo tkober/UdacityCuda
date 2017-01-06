@@ -266,7 +266,7 @@ void prefix_sum(
   // Always use 1024 threads due to Blelloch only works on lenghts that are a
   // power of two.
   const int THREAD_COUNT = 1024;
-  const int BLOCK_COUNT = ceil(input_size / THREAD_COUNT);
+  const int BLOCK_COUNT = ceil((double) input_size / (double) THREAD_COUNT);
 
   // Execute stage 1
   int shared_size = THREAD_COUNT * sizeof(int);
@@ -282,8 +282,8 @@ void prefix_sum(
     gather_every_nth<<<1, BLOCK_COUNT>>>(d_output, d_block_sums, THREAD_COUNT);
 
     // Scan the final sums of the blocks
-    shared_size = BLOCK_COUNT * sizeof(int);
-    local_blelloch_prefix_sum<<<1, BLOCK_COUNT, shared_size>>>(d_block_sums, input_size, d_block_sums);
+    shared_size = THREAD_COUNT * sizeof(int);
+    local_blelloch_prefix_sum<<<1, THREAD_COUNT, shared_size>>>(d_block_sums, BLOCK_COUNT, d_block_sums);
 
     // Add the block sums to the input items
     add_block_sums<<<BLOCK_COUNT, THREAD_COUNT>>>(d_output, input_size, d_block_sums);
