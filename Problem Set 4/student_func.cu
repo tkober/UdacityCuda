@@ -314,12 +314,36 @@ void calculate_relativ_positions(
 }
 
 
+__global__ void reorder_scatter(
+  unsigned int* const from_values,
+  unsigned int* const from_positions,
+  unsigned int* const to_values,
+  unsigned int* const to_positions,
+  int size,
+  int start_position,
+  int *relative_positions,
+  int bit,
+  int bit_set
+) {
+  int index = threadIdx.x + blockIdx.x * blockDim.x;
+  if (index < size) {
+    int is_bit_set = (from_values[index] & (1 << bit)) > 0;
+    if (is_bit_set == bit_set) {
+      to_values[index] = from_values[index];
+      to_positions[index] = from_positions[index];
+    }
+  }
+}
+
+
 void your_sort(unsigned int* const d_inputVals,
                unsigned int* const d_inputPos,
                unsigned int* const d_outputVals,
                unsigned int* const d_outputPos,
                const size_t numElems)
 {
+  const int THREAD_COUNT = min((int) numElems, 1024);
+  const int BLOCK_COUNT = ceil(numElems / THREAD_COUNT);
   // The number if steps in the Radix sort,
   // corresponding to the number of bits/digits
   const int LENGHT = 8 * sizeof(unsigned int);
@@ -333,21 +357,40 @@ void your_sort(unsigned int* const d_inputVals,
   cudaMalloc((void **) &d_relative_positions, sizeof(int) * numElems);
 
   // Process one radix step per bit/digit
-  for (int i = 0; i < LENGHT; i++) {
+  int i;
+  for (i = 0; i < LENGHT; i++) {
+    // Alternate on every step:
+    // step even: I -> O
+    // step odd:  O -> I
+    int is_step_even = (i % 2) == 0;
+    unsigned int *const d_from_val  = is_step_even ? d_inputVals : d_outputVals;
+    unsigned int *const d_from_pos  = is_step_even ? d_inputPos : d_outputPos;
+    unsigned int *const d_to_val    = is_step_even ? d_outputVals : d_inputVals;
+    unsigned int *const d_to_pos    = is_step_even ? d_outputPos : d_inputPos;
 
     // Create a histogram for the occurrences of 0 and 1
     // for the current bit/digit
-    historgram_for_bit(d_inputVals, d_histogram, numElems, i);
+    historgram_for_bit(d_from_val, d_histogram, numElems, i);
 
     // Calculate relative positions for bits/digit that are equal to 0
-    calculate_relativ_positions(d_inputVals, numElems, d_relative_positions, i, 0);
+    calculate_relativ_positions(d_from_val, numElems, d_relative_positions, i, 0);
 
-    // TODO: Scatter
+    // Scatter the items to their new position
+    reorder_scatter<<<BLOCK_COUNT, THREAD_COUNT>>>(d_from_val, d_from_pos,
+      d_to_val, d_to_pos, numElems, d_histogram[0], d_relative_positions, i, 0);
 
     // Calculate relative positions for bits/digit that are equal to 1
     calculate_relativ_positions(d_inputVals, numElems, d_relative_positions, i, 1);
 
-    // TODO: Scatter
+    // Scatter the items to their new position
+    reorder_scatter<<<BLOCK_COUNT, THREAD_COUNT>>>(d_from_val, d_from_pos,
+      d_to_val, d_to_pos, numElems, d_histogram[1], d_relative_positions, i, 1);
+  }
+
+  // if radix step count is even copy once again, so the result is in d_output
+  if (i % 2 == 0) {
+    cudaMemcpy(d_outputVals, d_inputVals, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(d_outputPos, d_inputPos, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
   }
 
   cudaFree(d_histogram);
