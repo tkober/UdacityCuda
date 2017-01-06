@@ -320,17 +320,26 @@ __global__ void reorder_scatter(
   unsigned int* const to_values,
   unsigned int* const to_positions,
   int size,
-  int start_position,
-  int *relative_positions,
+  int *d_histogram,
+  int *d_relative_positions,
   int bit,
   int bit_set
 ) {
+  __shared__ int start_position;
+  if (threadIdx.x == 0) {
+    // Instead of exclusive scaning a histogram with two elements
+    // map the according values manually
+    start_position = bit_set ? d_histogram[0] : 0;
+  }
+  __syncthreads();
+
   int index = threadIdx.x + blockIdx.x * blockDim.x;
   if (index < size) {
     int is_bit_set = (from_values[index] & (1 << bit)) > 0;
     if (is_bit_set == bit_set) {
-      to_values[index] = from_values[index];
-      to_positions[index] = from_positions[index];
+      int new_index = start_position + d_relative_positions[index];
+      to_values[new_index] = from_values[index];
+      to_positions[new_index] = from_positions[index];
     }
   }
 }
@@ -377,14 +386,14 @@ void your_sort(unsigned int* const d_inputVals,
 
     // Scatter the items to their new position
     reorder_scatter<<<BLOCK_COUNT, THREAD_COUNT>>>(d_from_val, d_from_pos,
-      d_to_val, d_to_pos, numElems, d_histogram[0], d_relative_positions, i, 0);
+      d_to_val, d_to_pos, numElems, d_histogram, d_relative_positions, i, 0);
 
     // Calculate relative positions for bits/digit that are equal to 1
     calculate_relativ_positions(d_inputVals, numElems, d_relative_positions, i, 1);
 
     // Scatter the items to their new position
     reorder_scatter<<<BLOCK_COUNT, THREAD_COUNT>>>(d_from_val, d_from_pos,
-      d_to_val, d_to_pos, numElems, d_histogram[1], d_relative_positions, i, 1);
+      d_to_val, d_to_pos, numElems, d_histogram, d_relative_positions, i, 1);
   }
 
   // if radix step count is even copy once again, so the result is in d_output
