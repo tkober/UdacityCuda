@@ -266,11 +266,6 @@ void calculate_relativ_positions(
 
   // Calculate the predicates for the values
   calculate_predicates<<<BLOCK_COUNT, THREAD_COUNT>>>(d_values, value_count, d_output, MASK, matching_value);
-  ///
-  // int h_predicates[4];
-  // cudaMemcpy(h_predicates, d_output, sizeof(int) * 4, cudaMemcpyDeviceToHost);
-  // printf("pred. b=%i --> [%i, %i, %i, %i]\n", matching_value, h_predicates[3], h_predicates[2], h_predicates[1], h_predicates[0]);
-  ///
 
   // Execute an exclusive (prefix-)sum scan to get the relative positions
   prefix_sum(d_output, value_count, d_output);
@@ -299,14 +294,6 @@ __global__ void reorder_scatter(
   }
 }
 
-
-///
-int get_bit(int n, int bit) {
-  return (n & (1<<bit)) > 0;
-}
-///
-
-
 int main(int argc, char const **argv) {
   const size_t numElems = 4;
   unsigned int h_numbers[] = { 7, 14, 4, 1};
@@ -323,30 +310,23 @@ int main(int argc, char const **argv) {
 
   cudaMemcpy(d_inputVals, h_numbers, sizeof(unsigned int) * numElems, cudaMemcpyHostToDevice);
   cudaMemcpy(d_inputPos, h_numbers, sizeof(unsigned int) * numElems, cudaMemcpyHostToDevice);
-  printf("INPUT:\n");
-  printf("i\tval\tbits\n");
-  printf("-------------------\n");
-  for (int j = 0; j < numElems; j++) {
-    printf("%i\t%i\t%i %i %i %i\n", j, h_numbers[j], get_bit(h_numbers[j], 3), get_bit(h_numbers[j], 2), get_bit(h_numbers[j], 1), get_bit(h_numbers[j], 0));
-  }
-  printf("\n\n");
+
 
   const int THREAD_COUNT = min((int) numElems, 1024);
   const int BLOCK_COUNT = ceil(numElems / THREAD_COUNT);
   // The number if steps in the Radix sort,
   // corresponding to the number of bits/digits
-  const int LENGHT = 4;//8 * sizeof(unsigned int);
+  const int LENGHT = 8 * sizeof(unsigned int);
 
   // Allocate device memory for a binary histogram
   int *d_histogram;
   cudaMalloc((void **) &d_histogram, sizeof(int) * 2);
+  int h_histogram[2];
+  h_histogram[0] = 0;
 
   // Allocate device memory for the relative positions
   int *d_relative_positions;
   cudaMalloc((void **) &d_relative_positions, sizeof(int) * numElems);
-
-  int h_histogram[2];
-  h_histogram[0] = 0;
 
   // Process one radix step per bit/digit
   int i = 0;
@@ -364,6 +344,7 @@ int main(int argc, char const **argv) {
     // Create a histogram for the occurrences of 0 and 1
     // for the current bit/digit
     historgram_for_bit(d_from_val, d_histogram, numElems, i);
+    // Create the prefix sum by hand instead of invoking a kerneĺ for it
     cudaMemcpy(h_histogram+1, d_histogram, sizeof(int), cudaMemcpyDeviceToHost);
 
     // Calculate relative positions for bits/digit that are equal to 0
@@ -379,19 +360,6 @@ int main(int argc, char const **argv) {
     // Scatter the items to their new position
     reorder_scatter<<<BLOCK_COUNT, THREAD_COUNT>>>(d_from_val, d_from_pos,
       d_to_val, d_to_pos, numElems, h_histogram[1], d_relative_positions, i, 1);
-
-
-    unsigned int h_result_vals[numElems];
-    unsigned int h_result_pos[numElems];
-    cudaMemcpy(h_result_vals, d_to_val, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_result_pos, d_to_pos, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost);
-
-    printf("i\tval\tbits\n");
-    printf("-------------------\n");
-    for (int j = 0; j < numElems; j++) {
-      printf("%i\t%i\t%i %i %i %i\n", j, h_result_vals[j], get_bit(h_result_vals[j], 3), get_bit(h_result_vals[j], 2), get_bit(h_result_vals[j], 1), get_bit(h_result_vals[j], 0));
-    }
-    printf("\n");
   }
 
   // if radix step count is even copy once again, so the result is in d_output
@@ -399,6 +367,18 @@ int main(int argc, char const **argv) {
     cudaMemcpy(d_outputVals, d_inputVals, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
     cudaMemcpy(d_outputPos, d_inputPos, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
   }
+
+  unsigned int h_result_vals[numElems];
+  unsigned int h_result_pos[numElems];
+  cudaMemcpy(h_result_vals, d_outputVals, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_result_pos, d_outputPos, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost);
+
+  printf("i\tval\tpos\n");
+  printf("-------------------\n");
+  for (int j = 0; j < numElems; j++) {
+    printf("%i\t%i\t%i\n", j, h_result_vals[j], h_result_pos[j]);
+  }
+  printf("\n");
 
   cudaFree(d_histogram);
   cudaFree(d_relative_positions);
