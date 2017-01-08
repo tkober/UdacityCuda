@@ -129,10 +129,11 @@ __global__ void calculate_predicates(
 }
 
 
-__global__ void local_blelloch_prefix_sum(
+__global__ void local_blelloch_sum(
   int *d_input,
   int input_size,
-  int *d_output
+  int *d_output,
+  int inclusive
 ) {
   extern __shared__ int temp[];
   int tid = threadIdx.x;
@@ -155,7 +156,7 @@ __global__ void local_blelloch_prefix_sum(
 
   // Set the last (local) element to zero
   if (tid == (blockDim.x-1)) {
-    temp[tid] = blockIdx.x > 0 ? temp[0] : 0;
+    temp[tid] = 0;
   }
   __syncthreads();
 
@@ -173,7 +174,11 @@ __global__ void local_blelloch_prefix_sum(
 
   // Copy the results if the index does not execeed the input size
   if (index < input_size) {
-    d_output[index] = temp[tid];
+    if (inclusive) {
+      d_output[index] = (tid == blockDim.x-1) ? temp[tid] + d_input[index] : temp[tid+1];
+    } else {
+      d_output[index] = temp[tid];
+    }
   }
 }
 
@@ -210,16 +215,17 @@ __global__ void gather_every_nth(
 }
 
 /**
- * A two staged exclusive sum scan that can handle an arbitrary number of
+ * A two staged sum scan that can handle an arbitrary number of
  * elements between 0 and 1024^2.
  *
  * Stage 1: 1024 single Blelloch scans with 1024 elements each
  * Stage 2: 1 Blelloch scan of the 1024 maximums (as required)
  */
-void prefix_sum(
+void sum_scan(
   int *d_input,
   int input_size,
-  int *d_output
+  int *d_output,
+  int inclusive
 ) {
   // Always use 1024 threads due to Blelloch only works on lenghts that are a
   // power of two.
@@ -228,7 +234,7 @@ void prefix_sum(
 
   // Execute stage 1
   int shared_size = THREAD_COUNT * sizeof(int);
-  local_blelloch_prefix_sum<<<BLOCK_COUNT, THREAD_COUNT, shared_size>>>(d_input, input_size, d_output);
+  local_blelloch_sum<<<BLOCK_COUNT, THREAD_COUNT, shared_size>>>(d_input, input_size, d_output, inclusive);
 
   // Execute state 2 (if necessary)
   if (BLOCK_COUNT > 1) {
@@ -241,7 +247,7 @@ void prefix_sum(
 
     // Scan the final sums of the blocks
     shared_size = THREAD_COUNT * sizeof(int);
-    local_blelloch_prefix_sum<<<1, THREAD_COUNT, shared_size>>>(d_block_sums, BLOCK_COUNT, d_block_sums);
+    local_blelloch_sum<<<1, THREAD_COUNT, shared_size>>>(d_block_sums, BLOCK_COUNT, d_block_sums, 0);
 
     // Add the block sums to the input items
     add_block_sums<<<BLOCK_COUNT, THREAD_COUNT>>>(d_output, input_size, d_block_sums);
@@ -252,7 +258,7 @@ void prefix_sum(
 }
 
 
-void calculate_relativ_positions(
+void calculate_relative_offsets(
   unsigned int *const d_values,
   int value_count,
   int *d_output,
@@ -268,7 +274,7 @@ void calculate_relativ_positions(
   calculate_predicates<<<BLOCK_COUNT, THREAD_COUNT>>>(d_values, value_count, d_output, MASK, matching_value);
 
   // Execute an exclusive (prefix-)sum scan to get the relative positions
-  prefix_sum(d_output, value_count, d_output);
+  sum_scan(d_output, value_count, d_output, 1);
 }
 
 
@@ -279,7 +285,7 @@ __global__ void reorder_scatter(
   unsigned int* const to_positions,
   int size,
   int start_position,
-  int *d_relative_positions,
+  int *d_relative_offsets,
   int bit,
   int bit_set
 ) {
@@ -287,7 +293,7 @@ __global__ void reorder_scatter(
   if (index < size) {
     int is_bit_set = (from_values[index] & (1 << bit)) > 0;
     if (is_bit_set == bit_set) {
-      int new_index = start_position + d_relative_positions[index];
+      int new_index = start_position + d_relative_offsets[index] - 1;
       to_values[new_index] = from_values[index];
       to_positions[new_index] = from_positions[index];
     }
@@ -295,8 +301,11 @@ __global__ void reorder_scatter(
 }
 
 int main(int argc, char const **argv) {
-  const size_t numElems = 4;
-  unsigned int h_numbers[] = { 7, 14, 4, 1};
+  const size_t numElems = 2050;
+  unsigned int h_numbers[numElems];
+  for (size_t k = 0; k < numElems; k++) {
+    h_numbers[k] = k;
+  }
 
   unsigned int *d_inputVals;
   unsigned int *d_inputPos;
@@ -313,8 +322,8 @@ int main(int argc, char const **argv) {
 
 
   const int THREAD_COUNT = min((int) numElems, 1024);
-  const int BLOCK_COUNT = ceil(numElems / THREAD_COUNT);
-  // The number if steps in the Radix sort,
+  const int BLOCK_COUNT = ceil((float) numElems / (float) THREAD_COUNT);
+  // The number of steps in the Radix sort,
   // corresponding to the number of bits/digits
   const int LENGHT = 8 * sizeof(unsigned int);
 
@@ -325,8 +334,8 @@ int main(int argc, char const **argv) {
   h_histogram[0] = 0;
 
   // Allocate device memory for the relative positions
-  int *d_relative_positions;
-  cudaMalloc((void **) &d_relative_positions, sizeof(int) * numElems);
+  int *d_relative_offsets;
+  cudaMalloc((void **) &d_relative_offsets, sizeof(int) * numElems);
 
   // Process one radix step per bit/digit
   int i = 0;
@@ -348,18 +357,18 @@ int main(int argc, char const **argv) {
     cudaMemcpy(h_histogram+1, d_histogram, sizeof(int), cudaMemcpyDeviceToHost);
 
     // Calculate relative positions for bits/digit that are equal to 0
-    calculate_relativ_positions(d_from_val, numElems, d_relative_positions, i, 0);
+    calculate_relative_offsets(d_from_val, numElems, d_relative_offsets, i, 0);
 
     // Scatter the items to their new position
     reorder_scatter<<<BLOCK_COUNT, THREAD_COUNT>>>(d_from_val, d_from_pos,
-      d_to_val, d_to_pos, numElems, h_histogram[0], d_relative_positions, i, 0);
+      d_to_val, d_to_pos, numElems, h_histogram[0], d_relative_offsets, i, 0);
 
     // Calculate relative positions for bits/digit that are equal to 1
-    calculate_relativ_positions(d_from_val, numElems, d_relative_positions, i, 1);
+    calculate_relative_offsets(d_from_val, numElems, d_relative_offsets, i, 1);
 
     // Scatter the items to their new position
     reorder_scatter<<<BLOCK_COUNT, THREAD_COUNT>>>(d_from_val, d_from_pos,
-      d_to_val, d_to_pos, numElems, h_histogram[1], d_relative_positions, i, 1);
+      d_to_val, d_to_pos, numElems, h_histogram[1], d_relative_offsets, i, 1);
   }
 
   // if radix step count is even copy once again, so the result is in d_output
@@ -374,14 +383,14 @@ int main(int argc, char const **argv) {
   cudaMemcpy(h_result_pos, d_outputPos, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost);
 
   printf("i\tval\tpos\n");
-  printf("-------------------\n");
+  printf("--------------------------\n");
   for (int j = 0; j < numElems; j++) {
     printf("%i\t%i\t%i\n", j, h_result_vals[j], h_result_pos[j]);
   }
   printf("\n");
 
   cudaFree(d_histogram);
-  cudaFree(d_relative_positions);
+  cudaFree(d_relative_offsets);
   cudaFree(d_inputVals);
   cudaFree(d_inputPos);
   cudaFree(d_outputVals);
